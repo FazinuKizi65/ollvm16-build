@@ -1,0 +1,102 @@
+name: build-ollvm16
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake python3 git
+
+      - name: clone llvm
+        run: |
+          git clone --depth 1 -b release/16.x https://github.com/llvm/llvm-project.git /tmp/llvm-project
+
+      - name: clone ollvm16
+        run: |
+          git clone --depth 1 https://github.com/wwh1004/ollvm-16.git /tmp/ollvm-16
+
+      - name: integrate obfuscation
+        run: |
+          cp -r /tmp/ollvm-16/Obfuscation /tmp/llvm-project/llvm/lib/Obfuscation
+          python3 - <<'PY'
+          p='/tmp/llvm-project/llvm/lib/CMakeLists.txt'
+          s=open(p).read()
+          if 'add_subdirectory(Obfuscation)' not in s:
+              s=s.replace('add_subdirectory(WindowsManifest)', 'add_subdirectory(WindowsManifest)\nadd_subdirectory(Obfuscation)')
+              open(p,'w').write(s)
+              print('patched')
+          else:
+              print('already patched')
+          PY
+          # Link obfuscation passes into tools for -mllvm flags
+          python3 - <<'PY'
+          # Make Obfuscation available as a component linked into tools
+          p='/tmp/llvm-project/llvm/lib/Obfuscation/CMakeLists.txt'
+          s=open(p).read()
+          # add component library too
+          if 'add_llvm_component_library' not in s:
+              s2 = s.replace('add_llvm_pass_plugin(Obfuscation',
+              '''if(LLVM_OBFUSCATION_LINK_INTO_TOOLS)
+  add_llvm_component_library(LLVMObfuscation
+    CryptoUtils.cpp
+    Substitution.cpp
+    BogusControlFlow.cpp
+    Utils.cpp
+    SplitBasicBlock.cpp
+    Flattening.cpp
+    Plugin.cpp
+    ADDITIONAL_HEADER_DIRS ${PROJECT_SOURCE_DIR}
+    DEPENDS intrinsics_gen
+  )
+else()
+  add_llvm_pass_plugin(Obfuscation''')
+              if s2 != s:
+                  # close the else
+                  s2 = s2.rstrip() + '\nendif()\n'
+                  open(p,'w').write(s2)
+                  print('cmake patched')
+              else:
+                  print('no change')
+          else:
+              print('already')
+          PY
+
+      - name: configure
+        run: |
+          cmake -S /tmp/llvm-project/llvm -B /tmp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_OBFUSCATION_LINK_INTO_TOOLS=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/tmp/install
+
+      - name: build
+        run: |
+          ninja -C /tmp/build -j2 clang lld llvm-ar llvm-nm objcopy llvm-objcopy llvm-strip
+
+      - name: package
+        run: |
+          mkdir -p /tmp/out/ollvm/bin
+          cp /tmp/build/bin/clang-16 /tmp/out/ollvm/bin/clang-16 || cp /tmp/build/bin/clang /tmp/out/ollvm/bin/clang-16
+          cp /tmp/build/bin/clang /tmp/out/ollvm/bin/clang || true
+          # copy needed libs if any
+          if [ -d /tmp/build/lib/clang ]; then cp -a /tmp/build/lib/clang /tmp/out/ollvm/libclang; fi
+          (cd /tmp/out && tar -czf /tmp/ollvm.tar.gz ollvm)
+          ls -lh /tmp/ollvm.tar.gz
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollvm16-linux-x86_64
+          path: /tmp/ollvm.tar.gz
